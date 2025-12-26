@@ -92,19 +92,11 @@ async def deep_link_start(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
 
     code = args[0].strip()
-
-    # ===== Anti-share: claim-on-first-use =====
-    status, file_id = STORE.claim_link(code, update.effective_user.id)
-
-    if status == "INVALID" or not file_id:
+    file_id = STORE.get_file_id_by_code(code)
+    if not file_id:
         await update.message.reply_text("Link invalid / sudah tidak berlaku.")
         return
 
-    if status == "NOT_OWNER":
-        await update.message.reply_text("⛔ Link ini sudah terikat ke akun lain. Minta link baru ya.")
-        return
-
-    # status == "OK"
     await gate_or_send(update, context, file_id)
 
 
@@ -194,7 +186,6 @@ async def save_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     code = None
     for _ in range(20):
         c = gen_code(10)
-        # cukup cek tidak ada di DB
         if not STORE.get_file_id_by_code(c):
             code = c
             break
@@ -202,12 +193,11 @@ async def save_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await msg.reply_text("Gagal generate code unik. Coba ulang.")
         return
 
-    # owner_user_id masih NULL sampai ada user yang klik link pertama kali
     STORE.save_link(code, file_id)
 
     link = f"https://t.me/{me.username}?start={code}"
     await msg.reply_html(
-        f"<b>Saved.</b>\n\nLink:\n<code>{link}</code>\n\n<i>Note:</i> Link akan terkunci ke akun pertama yang membukanya.",
+        f"<b>Saved.</b>\n\nLink:\n<code>{link}</code>",
         disable_web_page_preview=True,
     )
 
