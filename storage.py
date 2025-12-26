@@ -25,6 +25,9 @@ class Storage(Protocol):
     def save_link(self, code: str, file_id: str) -> None: ...
     def get_file_id_by_code(self, code: str) -> Optional[str]: ...
 
+    # anti-share (claim-on-first-use)
+    def claim_link(self, code: str, user_id: int) -> tuple[str, Optional[str]]: ...
+
 
 class SQLiteStorage:
     def __init__(self, path: str = "data.db") -> None:
@@ -38,11 +41,13 @@ class SQLiteStorage:
             caption TEXT
         )
         """)
-        # mapping kode pendek -> file_id
+
+        # mapping kode pendek -> file_id + pemilik (anti share)
         self.conn.execute("""
         CREATE TABLE IF NOT EXISTS links (
             code TEXT PRIMARY KEY,
-            file_id TEXT NOT NULL
+            file_id TEXT NOT NULL,
+            owner_user_id INTEGER
         )
         """)
         self.conn.commit()
@@ -71,16 +76,54 @@ class SQLiteStorage:
 
     # ===== short link methods =====
     def save_link(self, code: str, file_id: str) -> None:
-        self.conn.execute(
-            "INSERT OR REPLACE INTO links(code, file_id) VALUES(?, ?)",
-            (code, file_id),
-        )
+        # Kalau code sudah ada, jangan overwrite owner_user_id
+        self.conn.execute("""
+        INSERT INTO links(code, file_id, owner_user_id)
+        VALUES(?, ?, NULL)
+        ON CONFLICT(code) DO UPDATE SET
+          file_id=excluded.file_id
+        """, (code, file_id))
         self.conn.commit()
 
     def get_file_id_by_code(self, code: str) -> Optional[str]:
         cur = self.conn.execute("SELECT file_id FROM links WHERE code=?", (code,))
         row = cur.fetchone()
         return row[0] if row else None
+
+    def claim_link(self, code: str, user_id: int) -> tuple[str, Optional[str]]:
+        """
+        Return (status, file_id)
+        status:
+          - "OK"        -> boleh ambil, file_id valid
+          - "NOT_OWNER" -> sudah di-claim user lain
+          - "INVALID"   -> code tidak ada
+        """
+        cur = self.conn.execute("SELECT file_id, owner_user_id FROM links WHERE code=?", (code,))
+        row = cur.fetchone()
+        if not row:
+            return "INVALID", None
+
+        file_id, owner = row[0], row[1]
+
+        if owner is None:
+            # Claim pertama kali (coba atomic)
+            self.conn.execute(
+                "UPDATE links SET owner_user_id=? WHERE code=? AND owner_user_id IS NULL",
+                (user_id, code),
+            )
+            self.conn.commit()
+
+            # Re-check siapa yang berhasil claim
+            cur2 = self.conn.execute("SELECT owner_user_id FROM links WHERE code=?", (code,))
+            owner2 = cur2.fetchone()[0]
+            if int(owner2) == int(user_id):
+                return "OK", file_id
+            return "NOT_OWNER", None
+
+        if int(owner) != int(user_id):
+            return "NOT_OWNER", None
+
+        return "OK", file_id
 
 
 class MongoStorage:
@@ -93,7 +136,6 @@ class MongoStorage:
         self.files = db["files"]
         self.files.create_index("file_id", unique=True)
 
-        # mapping kode pendek -> file_id
         self.links = db["links"]
         self.links.create_index("code", unique=True)
 
@@ -112,15 +154,38 @@ class MongoStorage:
 
     # ===== short link methods =====
     def save_link(self, code: str, file_id: str) -> None:
+        # Jangan overwrite owner_user_id kalau sudah ada
         self.links.update_one(
             {"code": code},
-            {"$set": {"code": code, "file_id": file_id}},
+            {"$set": {"file_id": file_id}, "$setOnInsert": {"code": code, "owner_user_id": None}},
             upsert=True
         )
 
     def get_file_id_by_code(self, code: str) -> Optional[str]:
         doc = self.links.find_one({"code": code}, {"_id": 0, "file_id": 1})
         return doc["file_id"] if doc else None
+
+    def claim_link(self, code: str, user_id: int) -> tuple[str, Optional[str]]:
+        doc = self.links.find_one({"code": code}, {"_id": 0, "file_id": 1, "owner_user_id": 1})
+        if not doc:
+            return "INVALID", None
+
+        owner = doc.get("owner_user_id", None)
+        file_id = doc.get("file_id")
+
+        if owner is None:
+            res = self.links.update_one(
+                {"code": code, "owner_user_id": None},
+                {"$set": {"owner_user_id": int(user_id)}}
+            )
+            if res.modified_count == 1:
+                return "OK", file_id
+            return "NOT_OWNER", None
+
+        if int(owner) != int(user_id):
+            return "NOT_OWNER", None
+
+        return "OK", file_id
 
 
 def build_storage(backend: str, mongo_uri: str, mongo_db: str) -> Storage:
