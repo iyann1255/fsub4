@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 from uuid import uuid4
 
 from telegram import Update
+from telegram.error import NetworkError, TimedOut
+from telegram.request import HTTPXRequest
 from telegram.ext import (
     Application,
     ApplicationBuilder,
@@ -40,6 +43,24 @@ def _admin_only(user_id: int) -> bool:
     return user_id in CFG.admins
 
 
+async def _retryable_copy_message(context, chat_id, from_chat_id, message_id, tries: int = 3):
+    """
+    Retry copy_message on transient network errors/timeouts.
+    """
+    last_err = None
+    for i in range(tries):
+        try:
+            return await context.bot.copy_message(
+                chat_id=chat_id,
+                from_chat_id=from_chat_id,
+                message_id=message_id,
+            )
+        except (TimedOut, NetworkError) as e:
+            last_err = e
+            await asyncio.sleep(1.5 * (i + 1))
+    raise last_err
+
+
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     u = update.effective_user
     if not u or not update.message:
@@ -71,10 +92,11 @@ async def gate_or_send(update: Update, context: ContextTypes.DEFAULT_TYPE, file_
         return
 
     try:
-        await context.bot.copy_message(
-            chat_id=msg.chat_id,
-            from_chat_id=rec.db_chat_id,
-            message_id=rec.db_message_id,
+        await _retryable_copy_message(
+            context,
+            msg.chat_id,
+            rec.db_chat_id,
+            rec.db_message_id,
         )
     except Exception as e:
         log.exception("copy_message failed: %s", e)
@@ -92,9 +114,16 @@ async def deep_link_start(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
 
     code = args[0].strip()
-    file_id = STORE.get_file_id_by_code(code)
-    if not file_id:
+
+    # Anti-share: claim-on-first-use
+    status, file_id = STORE.claim_link(code, update.effective_user.id)
+
+    if status == "INVALID" or not file_id:
         await update.message.reply_text("Link invalid / sudah tidak berlaku.")
+        return
+
+    if status == "NOT_OWNER":
+        await update.message.reply_text("⛔ Link ini sudah terikat ke akun lain. Minta link baru ya.")
         return
 
     await gate_or_send(update, context, file_id)
@@ -125,7 +154,6 @@ async def done_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     except Exception:
         pass
 
-    # send file (reply into the chat where gate message was shown)
     fake_update = Update(update.update_id, message=q.message)
     await gate_or_send(fake_update, context, file_id)
 
@@ -136,7 +164,6 @@ async def save_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not msg or not u:
         return
 
-    # cuma admin/owner yang boleh "input" ke database
     if not _admin_only(u.id):
         return
 
@@ -154,12 +181,12 @@ async def save_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     else:
         return
 
-    # copy ke channel database
     try:
-        copied = await context.bot.copy_message(
-            chat_id=CFG.channel_id,
-            from_chat_id=msg.chat_id,
-            message_id=msg.message_id,
+        copied = await _retryable_copy_message(
+            context,
+            CFG.channel_id,
+            msg.chat_id,
+            msg.message_id,
         )
     except Exception as e:
         log.exception("copy to db channel failed: %s", e)
@@ -182,7 +209,6 @@ async def save_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await msg.reply_text("Bot belum punya username. Set dulu di @BotFather biar link /start bisa dipakai.")
         return
 
-    # generate code pendek yang unik
     code = None
     for _ in range(20):
         c = gen_code(10)
@@ -197,13 +223,25 @@ async def save_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     link = f"https://t.me/{me.username}?start={code}"
     await msg.reply_html(
-        f"<b>Saved.</b>\n\nLink:\n<code>{link}</code>",
+        f"<b>Saved.</b>\n\nLink:\n<code>{link}</code>\n\n<i>Note:</i> Link akan terkunci ke akun pertama yang membukanya.",
         disable_web_page_preview=True,
     )
 
 
 def main() -> None:
-    app: Application = ApplicationBuilder().token(CFG.bot_token).build()
+    request = HTTPXRequest(
+        connect_timeout=20,
+        read_timeout=60,
+        write_timeout=60,
+        pool_timeout=20,
+    )
+
+    app: Application = (
+        ApplicationBuilder()
+        .token(CFG.bot_token)
+        .request(request)
+        .build()
+    )
 
     app.add_handler(CommandHandler("start", deep_link_start))
     app.add_handler(CallbackQueryHandler(done_cb, pattern=r"^fsub_done:"))
